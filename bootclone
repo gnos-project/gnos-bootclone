@@ -1,0 +1,432 @@
+#!/bin/bash
+
+
+# CONST
+declare -a TRAP
+declare TRAP_REGISTERED
+CONFIG_FILE=/etc/bootclone.conf
+
+
+# FUNC: Documentation
+Usage ()
+{
+    echo >&2 "NAME: $( basename "$( readlink -f "$BASH_SOURCE" )" )"
+    cat <<'EOH' >&2
+DESC: Bootable ZFS root clones manager
+AUTH: elias@gnos.in
+
+USAGE:
+  list               Detail bootable clones
+  create NAME [SRC]  Create clone, SRC supports @snapshot
+  delete [-s] NAME   Delete clone and origin
+  detach [-s] NAME   Detach clone from origin
+  update             Update managed grub.cfg
+  help               Help
+EOH
+    [[ $1 -ne -1 ]] && exit $1
+}
+Help ()
+{
+    Usage -1
+    cat <<'EOH' >&2
+
+OPTIONS:
+  -s                 Also delete origin snapshot
+
+FILES:
+  /etc/bootclone.conf                      Configuration
+  $BOOTCLONE_MNTP/grub/grub.cfg            Managed grub configuration
+  $BOOTCLONE_MNTP/grub/bootclone-head.cfg  Managed grub header template
+  $BOOTCLONE_MNTP/grub/bootclone-foot.cfg  Managed grub footer template
+
+CONFIG:
+  $BOOTCLONE_TYPE  "zfs" OR "ext"
+  $BOOTCLONE_ROOT  Root-repo dataset, relative to root pool
+  $BOOTCLONE_MNTP  Grub-boot mountpoint
+  $BOOTCLONE_HEAD  Grub header, relative to $BOOTCLONE_MNTP
+  $BOOTCLONE_FOOT  Grub footer, relative to $BOOTCLONE_MNTP
+  $BOOTCLONE_BOOT  [ext-only] Boot-repo path, relative to $BOOTCLONE_MNTP
+EOH
+    exit
+}
+
+# FUNC: Trap
+Trap ()
+{
+    RegisterTrap
+    TRAP+=("$*")
+}
+RegisterTrap ()
+{
+    [[ "$TRAP_REGISTERED" == 1 ]] && return
+    trap "GlobalTrap" INT TERM EXIT QUIT
+    TRAP_REGISTERED=1
+}
+GlobalTrap ()
+{
+    Say "Exiting..."
+    for (( i=${#TRAP[@]}-1;i>=0;i-- )); do
+        eval "${TRAP[i]}"
+    done
+}
+
+# FUNC: Mount
+IsMounted ()
+{
+    awk -v m=$1 '$2==m {ok=1;exit} END {if (ok) exit 0; exit 1}' /proc/mounts
+}
+Mount ()
+{
+    local -a args
+    while [[ $1 =~ ^- ]] ; do
+        args+=("$1")
+        shift
+    done
+    mount "${args[@]}" "$@" || Die "Failed mounting $1"
+    Trap "umount -f ${@: -1}"
+}
+
+# FUNC: Log
+Die ()
+{
+    echo "ERROR: $@" >&2
+    exit 1
+}
+Say ()
+{
+    echo "$@" >&2
+}
+
+# FUNC: Utils
+SanitizeString ()
+{
+    echo -n "$@" | tr -c '_[:alnum:]' '-'
+}
+IsZfs () # $1:ZFS_DATASET
+{
+    zfs list $1 &>/dev/null
+}
+PatchFstabDeviceByMountpoint () # $1:FSTAB_FILE $2:MOUNT_POINT $3:NEW_DEVICE
+{
+    sed -i -E 's#^(\s*)(\S+)(\s+'"$2"'\s.*)$#\1'"$3"'\3#g' $1
+}
+
+# FUNC: Commands
+
+list ()
+{
+    local -a list
+    for dset in $( zfs list -d 1 -Ho name $POOL$BOOTCLONE_ROOT | awk 'NR>1' ) ; do
+        # TODO check valid clone ?
+        list+=($dset)
+    done
+      zfs list -d 0 -o name,used,refer,origin "${list[@]}" \
+    | sed -E 's#/([^/ ]+) #/\x1B[1m\1\x1B[0m #'
+}
+
+
+create ()
+{
+
+    # INIT: ARGS
+    local name=$( SanitizeString "$1" )
+    [[ "$name" != "$1" ]] && Die "name has invalid chars: '$1', use '$name' instead"
+
+    local dst_dset=$POOL$BOOTCLONE_ROOT/$name
+    local src_dset=$2
+
+    # default to current
+    [[ -z "$src_dset" ]] && src_dset=$( zfs list -Ho name / 2>/dev/null )
+
+    # Source snapshot support
+    local src_snap
+    if [[ "$src_dset" =~ @ ]] ; then
+        src_snap=${src_dset#*@}
+        src_dset=${src_dset%%@*}
+    fi
+
+
+    # INIT: CHECKS
+    IsZfs $src_dset || Die "dataset $src_dset does not exist"
+    IsZfs $dst_dset && Die "dataset $dst_dset already exists"
+
+    if [[ "$BOOTCLONE_TYPE" == 'ext' ]] ; then
+
+        local src_boot=$( SanitizeString "${src_dset##*/}" )
+        local dst_boot=$( SanitizeString "${dst_dset##*/}" )
+
+           [[ -z "$src_snap" && ! -d "$BOOTCLONE_MNTP$BOOTCLONE_BOOT/$src_boot" ]] \
+        && Die "$BOOTCLONE_MNTP$BOOTCLONE_BOOT/$src_boot does not exist"
+
+           [[ -e "$BOOTCLONE_MNTP$BOOTCLONE_BOOT/$dst_boot" ]] \
+        && Die "$BOOTCLONE_MNTP$BOOTCLONE_BOOT/$dst_boot already exists"
+
+    fi
+
+    if [[ -n "$src_snap" ]] ; then
+        IsZfs $src_dset@$src_snap || Die "Unknown snapshot $src_dset@$src_snap"
+    fi
+
+
+    # INIT: SNAP
+    local snapshot=$src_snap
+    [[ -z "$src_snap" ]] && snapshot=bootclone-$name
+
+    if [[ -z "$src_snap" ]] ; then
+        Say "Creating snapshot $src_dset@$snapshot"
+        zfs snapshot -r $src_dset@$snapshot || Die "Failed snapshot creation"
+    fi
+
+
+    # INIT: MOUNT
+    IsMounted $BOOTCLONE_MNTP || Mount $BOOTCLONE_MNTP
+
+       [[ -f "$BOOTCLONE_MNTP$BOOTCLONE_HEAD" ]] \
+    || Die "Missing grub template $BOOTCLONE_MNTP$BOOTCLONE_HEAD"
+
+    if [[ "$BOOTCLONE_TYPE" == 'ext' ]] ; then
+
+           [[ -d "$BOOTCLONE_MNTP$BOOTCLONE_BOOT/$src_boot" ]] \
+        || Die "Missing boot $BOOTCLONE_MNTP$BOOTCLONE_BOOT/$src_boot"
+
+# TODO check free space on EXT boot
+
+    fi
+
+
+    # MAIN
+    local target=$( mktemp -d )
+
+    Say "Creating clone $dst_dset"
+    zfs clone $src_dset@$snapshot $dst_dset || Die "Failed clone creation"
+
+    # Recursive clone
+    local canmount opt clone
+    while IFS= read -r dset || [[ -n $dset ]] ; do
+        opt=
+        canmount=$( zfs get -H -o value canmount "$dset" )
+        [[ "$canmount" == "off" ]] && opt="-o canmount=off"
+        clone=$dst_dset${dset#$src_dset}
+        # Say "Creating clone $clone"
+        zfs clone $opt $dset@$snapshot $clone || Die "Failed clone creation"
+    done < <( zfs list -r -H "$src_dset" | awk 'NR>1{print $1}' )
+
+    if [[ "$BOOTCLONE_TYPE" == 'ext' ]] ; then
+        Say "Duplicating boot"
+        # ALT rsync -av $BOOTCLONE_MNTP$BOOTCLONE_BOOT/$src_boot $BOOTCLONE_MNTP$BOOTCLONE_BOOT/$dst_boot
+           cp -R $BOOTCLONE_MNTP$BOOTCLONE_BOOT/$src_boot $BOOTCLONE_MNTP$BOOTCLONE_BOOT/$dst_boot \
+        || Die "Failed duplicating boot"
+    fi
+
+
+    Say "Mounting clone"
+    zfs set mountpoint=$target $dst_dset || Die "Failed mounting clone"
+
+    Trap "zfs set mountpoint=legacy $dst_dset"
+    Trap "zfs umount $target && rm -rf $target"
+
+    Mount --bind $BOOTCLONE_MNTP $target$BOOTCLONE_MNTP
+    Mount --bind /proc           $target/proc
+    Mount --bind /sys            $target/sys
+    Mount --bind /dev            $target/dev
+
+       [[ "$BOOTCLONE_TYPE" == 'ext' ]] \
+    && Mount --bind $BOOTCLONE_MNTP$BOOTCLONE_BOOT/$dst_boot $target/boot
+
+
+    Say "Configuring clone"
+    echo "GRUB_CMDLINE_LINUX_DEFAULT=\"\$GRUB_CMDLINE_LINUX_DEFAULT root=ZFS=$dst_dset bootfs=$dst_dset\"" \
+        >$target/etc/default/grub.d/96-bootclone.cfg
+
+    Say "Updating fstab"
+    PatchFstabDeviceByMountpoint $target/etc/fstab / $dst_dset
+
+    if [[ "$BOOTCLONE_TYPE" == 'ext' ]] ; then
+        PatchFstabDeviceByMountpoint \
+            $target/etc/fstab /boot $BOOTCLONE_MNTP$BOOTCLONE_BOOT/$dst_boot
+    fi
+
+    Say "Updating initramfs"
+    chroot $target /usr/sbin/update-initramfs -c -k all || Die "Failed updating initramfs"
+
+    Say "Updating grub"
+    chroot $target /usr/sbin/update-grub                || Die "Failed updating grub"
+
+    [[ "$BOOTCLONE_TYPE" == 'ext' ]] && update
+}
+
+
+delete ()
+{
+    local deleteSnap
+    if [[ "$1" == "-s" ]] ; then
+        deleteSnap=$1
+        shift
+    fi
+    local keepBoot # DEV: Internal
+    if [[ "$1" == "-k" ]] ; then
+        keepBoot=$1
+        shift
+    fi
+    [[ $# -eq 1 ]] || Usage 1
+
+    local target=$POOL$BOOTCLONE_ROOT/$1
+
+    IsZfs $target || Die "Unknown bootclone: $target"
+
+    if [[ "$BOOTCLONE_TYPE" == 'ext' ]] ; then
+        [[ -f "$BOOTCLONE_MNTP$BOOTCLONE_BOOT/$1" ]] || Die "Missing boot $BOOTCLONE_MNTP$BOOTCLONE_BOOT/$1"
+        [[ -f "$BOOTCLONE_MNTP$BOOTCLONE_HEAD" ]]    || Die "Missing grub template $BOOTCLONE_MNTP$BOOTCLONE_HEAD"
+    fi
+
+    local origin=$( zfs get origin -Ho value $target )
+    [[ "$origin" == '-' ]] && origin=
+
+
+    if [[ -n "$deleteSnap" && -n "$origin" ]] ; then
+        Say "Destroying from origin: $origin"
+        zfs destroy -R $origin
+    else
+        Say "Destroying dataset: $target"
+        zfs destroy -R $target
+    fi
+
+    if [[ "$BOOTCLONE_TYPE" == 'ext' && -z "$keepBoot" ]] ; then
+        Say "Deleting boot $BOOTCLONE_MNTP$BOOTCLONE_BOOT/$1"
+        rm -rf "$BOOTCLONE_MNTP$BOOTCLONE_BOOT/$1"
+        update
+    fi
+}
+
+
+detach ()
+{
+    which pv &>/dev/null || Die "Missing pv"
+
+    local deleteSnap
+    if [[ "$1" == "-s" ]] ; then
+        deleteSnap=$1
+        shift
+    fi
+    [[ $# -eq 1 ]] || Usage 1
+
+    local target=$POOL$BOOTCLONE_ROOT/$1
+    IsZfs $target || Die "Unknown bootclone: $target"
+
+# TODO check free space on ZFS
+
+    # Duplicate root
+    Say "Duplicating root: $target"
+    zfs rename $target $target.ORIG
+       zfs send $target.ORIG | pv | zfs recv $target \
+    || Die "Failed"
+
+    # Duplicate children
+    for dset in $( zfs list -r -Ho name $target.ORIG | tail -n +2 ) ; do
+        Say "Duplicating $dset"
+        zfs send $dset | pv | zfs recv $target/${dset#$target.ORIG/} || Die "Failed"
+    done
+
+    # Delete
+    delete $deleteSnap -k $( basename "$target.ORIG" )
+}
+
+
+update ()
+{
+    IsMounted $BOOTCLONE_MNTP || Mount $BOOTCLONE_MNTP
+
+       [[ -f "$BOOTCLONE_MNTP$BOOTCLONE_HEAD" ]] \
+    || Die "Missing grub template $BOOTCLONE_MNTP$BOOTCLONE_HEAD"
+
+    local grub_cfg_path=$BOOTCLONE_MNTP/grub/grub.cfg
+
+    # MAIN
+    Say "Updating managed grub"
+
+    echo -e "# AUTOMATICALLY GENERATED on $( date +%Y%m%d%H%M%S ) by $( readlink -f $0 )\n\n" >"$grub_cfg_path"
+
+       cat $BOOTCLONE_MNTP$BOOTCLONE_HEAD >>"$grub_cfg_path" \
+    || Die "Failed configuring $grub_cfg_path"
+
+    # TOCHECK submenu https://www.gnu.org/software/grub/manual/html_node/submenu.html#submenu
+
+    if [[ "$BOOTCLONE_TYPE" == 'zfs' ]] ; then
+
+        # zfs: AUTO list
+        cat <<EOG >>"$grub_cfg_path"
+insmod regexp
+for x in $BOOTCLONE_ROOT/*/@/boot/grub/grub.cfg ; do
+    if [ -f "\$x" ] ; then
+        menuentry "[clone  ] \$x" \$x {
+            configfile \$2
+        }
+    fi
+done
+
+EOG
+
+    else
+
+        # ext: STATIC list
+        local clone
+          find $BOOTCLONE_MNTP$BOOTCLONE_BOOT -mindepth 3 -maxdepth 3 -wholename '*/grub/grub.cfg' \
+        | while read -r clone || [[ -n $clone ]] ; do
+            clone=$( basename ${clone%/*/*} )
+            Say "Adding $clone"
+            echo -e "menuentry '$clone' {\n  configfile $BOOTCLONE_BOOT/$clone/grub/grub.cfg  \n}\n\n" \
+                >>"$grub_cfg_path"
+        done
+
+    fi
+
+    [[ -r "$BOOTCLONE_MNTP$BOOTCLONE_FOOT" ]] && cat $BOOTCLONE_MNTP$BOOTCLONE_FOOT >>"$grub_cfg_path"
+}
+
+#######
+# RUN #
+#######
+
+# INIT: ROOT
+[[ $( id -u ) == "0" ]] || Die "Requires root privileges"
+
+
+# INIT: CONFIG
+[[ -f "$CONFIG_FILE" ]] || Die "Missing config file $CONFIG_FILE"
+bash -n "$CONFIG_FILE"  || Die "Invalid config file $CONFIG_FILE"
+source "$CONFIG_FILE"
+POOL=$( zfs list -Ho name / 2>/dev/null )
+POOL=${POOL%%/*}
+
+
+# INIT: ARGS
+[[ $# -eq 0 ]] && Usage
+case $1 in
+    list|update)            [[ $# -eq 1 ]]              || Usage 1 ;;
+    create|delete|detach)   [[ $# -ge 2 && $# -le 3 ]]  || Usage 1 ;;
+    help)                   Help ;;
+    *)                      Usage 1 ;;
+esac
+
+
+# INIT: CHECKS
+[[ -n "$BOOTCLONE_ROOT" ]] || Die "Invalid config value: BOOTCLONE_ROOT"
+IsZfs $POOL$BOOTCLONE_ROOT || Die "Missing parent dataset $POOL$BOOTCLONE_ROOT"
+[[ -d "$BOOTCLONE_MNTP" ]] || Die "Missing boot mountpoint $BOOTCLONE_MNTP"
+
+   [[ "$BOOTCLONE_TYPE" != 'ext' && "$BOOTCLONE_TYPE" != 'zfs' ]] \
+&& Die "Invalid config value: BOOTCLONE_TYPE"
+
+if [[ "$BOOTCLONE_TYPE" == 'ext' ]] ; then
+
+       [[ ! -d "$BOOTCLONE_MNTP$BOOTCLONE_BOOT" ]] \
+    && Die "Missing ext boot repo $BOOTCLONE_MNTP$BOOTCLONE_BOOT"
+
+    #    [[ -f "$BOOTCLONE_MNTP$BOOTCLONE_HEAD" ]] \
+    # || Die "Missing grub template $BOOTCLONE_MNTP$BOOTCLONE_HEAD"
+
+fi
+
+# MAIN
+"$@"
+exit 0
