@@ -22,4 +22,4 @@ USAGE:
 
 ## Install
 
-Specific ZFS layout creation is done by GNOS Core [installer](https://github.com/gnos-project/gnos-installer).
+Specific ZFS layout creation is done by GNOS Core [installer](https://github.com/gnos-project/gnos-gnowledge).
